@@ -1579,6 +1579,70 @@ class TestEditMessage:
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert kwargs["text"] == "AT&amp;T &lt; 5 &gt; 3"
 
+    @pytest.mark.asyncio
+    async def test_edit_message_truncates_chat_update_preview(self, adapter):
+        """edit_message keeps chat.update text under Slack's stricter update path limits."""
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        content = "A" * (adapter.MAX_EDIT_MESSAGE_LENGTH + 1000)
+
+        result = await adapter.edit_message("C123", "1234.5678", content)
+
+        assert result.success is True
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert len(kwargs["text"]) <= adapter.MAX_EDIT_MESSAGE_LENGTH
+        assert kwargs["text"] != content
+
+
+class TestSlackBlockKitUpdateLimits:
+    """Regression coverage for Slack chat.update Block Kit size limits."""
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_update_truncates_original_section_text(self, adapter):
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        long_text = "C" * (adapter.MAX_BLOCK_TEXT_LENGTH + 1000)
+        body = {
+            "message": {
+                "ts": "1234.5678",
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": long_text}}],
+            },
+            "channel": {"id": "C123"},
+            "user": {"id": "U123", "name": "tester"},
+        }
+        action = {"action_id": "hermes_confirm_once", "value": "session-key|confirm-id"}
+
+        with patch("tools.slash_confirm.resolve", new=AsyncMock(return_value="")):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        section_text = kwargs["blocks"][0]["text"]["text"]
+        assert len(section_text) <= adapter.MAX_BLOCK_TEXT_LENGTH
+        assert section_text != long_text
+
+    @pytest.mark.asyncio
+    async def test_approval_update_truncates_original_section_text(self, adapter):
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        msg_ts = "1234.5678"
+        adapter._approval_resolved[msg_ts] = False
+        long_text = "D" * (adapter.MAX_BLOCK_TEXT_LENGTH + 1000)
+        body = {
+            "message": {
+                "ts": msg_ts,
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": long_text}}],
+            },
+            "channel": {"id": "C123"},
+            "user": {"id": "U123", "name": "tester"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            await adapter._handle_approval_action(AsyncMock(), body, action)
+
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        section_text = kwargs["blocks"][0]["text"]["text"]
+        assert len(section_text) <= adapter.MAX_BLOCK_TEXT_LENGTH
+        assert section_text != long_text
+
 
 # ---------------------------------------------------------------------------
 # TestEditMessageStreamingPipeline

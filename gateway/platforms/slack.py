@@ -282,6 +282,8 @@ class SlackAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+    MAX_BLOCK_TEXT_LENGTH = 2900  # Slack section block text max is 3000 chars; leave margin
+    MAX_EDIT_MESSAGE_LENGTH = 3500  # chat.update previews stay small; final replies are sent separately
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
@@ -825,10 +827,12 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_EDIT_MESSAGE_LENGTH)
+            text = chunks[0] if chunks else formatted
             await self._get_client(chat_id).chat_update(
                 channel=chat_id,
                 ts=message_id,
-                text=formatted,
+                text=text,
             )
             if finalize:
                 await self.stop_typing(chat_id)
@@ -2352,12 +2356,16 @@ class SlackAdapter(BasePlatformAdapter):
                 original_text = block.get("text", {}).get("text", "")
                 break
 
+        section_text = self.truncate_message(
+            original_text or "Confirmation prompt",
+            self.MAX_BLOCK_TEXT_LENGTH,
+        )[0]
         updated_blocks = [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": original_text or "Confirmation prompt",
+                    "text": section_text,
                 },
             },
             {
@@ -2453,12 +2461,16 @@ class SlackAdapter(BasePlatformAdapter):
                 original_text = block.get("text", {}).get("text", "")
                 break
 
+        section_text = self.truncate_message(
+            original_text or "Command approval request",
+            self.MAX_BLOCK_TEXT_LENGTH,
+        )[0]
         updated_blocks = [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": original_text or "Command approval request",
+                    "text": section_text,
                 },
             },
             {
