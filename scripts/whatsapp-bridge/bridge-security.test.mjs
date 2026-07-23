@@ -4,7 +4,34 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 
-import { tokensMatch, resolveAllowedDirs, isPathAllowed } from './bridge-security.js';
+import { tokensMatch, resolveAllowedDirs, isPathAllowed, checkBridgeAuth } from './bridge-security.js';
+
+const OPEN = new Set(['/health']);
+
+test('checkBridgeAuth: /health is open without a token', () => {
+  assert.equal(checkBridgeAuth('/health', undefined, '', OPEN), null);
+  assert.equal(checkBridgeAuth('/health', undefined, 's3cret', OPEN), null);
+});
+
+test('checkBridgeAuth: fails closed with 503 when the bridge token is unset', () => {
+  const r = checkBridgeAuth('/send', 'anything', '', OPEN);
+  assert.equal(r.status, 503);
+  // Every non-open route is refused when unconfigured, even with a header present.
+  assert.equal(checkBridgeAuth('/send-media', 's3cret', '', OPEN).status, 503);
+});
+
+test('checkBridgeAuth: 401 on missing or wrong token, null on exact match', () => {
+  assert.equal(checkBridgeAuth('/send', undefined, 's3cret', OPEN).status, 401);   // missing
+  assert.equal(checkBridgeAuth('/send', '', 's3cret', OPEN).status, 401);          // empty
+  assert.equal(checkBridgeAuth('/send', 'wrong!', 's3cret', OPEN).status, 401);    // wrong
+  assert.equal(checkBridgeAuth('/messages', 's3cret', 's3cret', OPEN), null);      // correct
+  assert.equal(checkBridgeAuth('/send-media', 's3cret', 's3cret', OPEN), null);    // correct
+});
+
+test('checkBridgeAuth: a mangled path that is not exactly /health still requires a token', () => {
+  // Path tricks can only make the gate MORE restrictive, never bypass it.
+  assert.equal(checkBridgeAuth('/health/../send', 'anything', 's3cret', OPEN).status, 401);
+});
 
 test('tokensMatch requires an exact, non-empty match', () => {
   assert.equal(tokensMatch('s3cret', 's3cret'), true);

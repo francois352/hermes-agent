@@ -25,11 +25,11 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { randomBytes } from 'crypto';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
-import { tokensMatch, resolveAllowedDirs, isPathAllowed } from './bridge-security.js';
+import { resolveAllowedDirs, isPathAllowed, checkBridgeAuth } from './bridge-security.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -54,15 +54,28 @@ const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); 
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 
 // Shared secret required on every state-changing / message-reading endpoint.
-// Loopback bind + Host validation stop remote & DNS-rebinding attackers but NOT a
-// co-located local process; the token ensures only the Hermes gateway can drive the
-// bridge. /health stays open for liveness probes. (CVE-2026-46555 class defense.)
+// Loopback bind + Host validation stop remote & DNS-rebinding attackers; the token
+// then ensures only a holder of the secret (the Hermes gateway) can drive the bridge.
+// This raises the bar against a LOWER-PRIVILEGED / sandboxed co-located process or a
+// prompt-injected agent used as a confused deputy. It does NOT isolate a same-UID
+// process — that can read the token from /proc/<pid>/environ and the target files
+// directly; true isolation would need separate UIDs + a mode-0600 unix socket.
+// /health stays open for liveness probes. (CVE-2026-46555 class defense.)
 const BRIDGE_TOKEN = (process.env.WHATSAPP_BRIDGE_TOKEN || '').trim();
+
+// Ensure the media + session dirs exist BEFORE we canonicalize them, so realpath
+// resolution is stable. Otherwise, under a symlinked HOME/parent, un-created roots
+// stay non-canonical and could (a) deny legitimate cache files or (b) let the
+// denylist miss the real session-creds path.
+for (const _d of [SESSION_DIR, IMAGE_CACHE_DIR, DOCUMENT_CACHE_DIR, AUDIO_CACHE_DIR]) {
+  mkdirSync(_d, { recursive: true });
+}
 
 // Directories /send-media is permitted to read from. Defaults to the media cache
 // dirs Hermes itself writes; operators extend via WHATSAPP_MEDIA_ALLOWED_DIRS
-// (colon-separated). Everything else — session creds, .env, ~/.ssh, patient data —
-// is denied, closing the arbitrary local-file read/exfil hole.
+// (colon-separated) to cover agent-generated output (reports, TTS, non-cache media)
+// — otherwise those legitimate sends are denied. Everything else — session creds,
+// .env, ~/.ssh, patient data — is denied, closing the arbitrary local-file read hole.
 const _mediaDirsFromEnv = (process.env.WHATSAPP_MEDIA_ALLOWED_DIRS || '')
   .split(':').map((s) => s.trim()).filter(Boolean);
 const MEDIA_ALLOWED_DIRS = resolveAllowedDirs([
@@ -428,18 +441,11 @@ app.use((req, res, next) => {
 // Bridge auth token — require a shared secret on every endpoint except /health.
 // Fails closed: if WHATSAPP_BRIDGE_TOKEN is unset the bridge refuses authenticated
 // requests (503) rather than silently allowing unauthenticated local access.
+// The decision lives in checkBridgeAuth() (bridge-security.js) so it is unit-tested.
 const _OPEN_PATHS = new Set(['/health']);
 app.use((req, res, next) => {
-  if (_OPEN_PATHS.has(req.path)) return next();
-  if (!BRIDGE_TOKEN) {
-    return res.status(503).json({
-      error: 'Bridge auth not configured. Set WHATSAPP_BRIDGE_TOKEN in the environment.',
-    });
-  }
-  const provided = req.headers['x-bridge-token'];
-  if (!tokensMatch(typeof provided === 'string' ? provided : '', BRIDGE_TOKEN)) {
-    return res.status(401).json({ error: 'Invalid or missing bridge token' });
-  }
+  const deny = checkBridgeAuth(req.path, req.headers['x-bridge-token'], BRIDGE_TOKEN, _OPEN_PATHS);
+  if (deny) return res.status(deny.status).json({ error: deny.error });
   next();
 });
 
@@ -541,7 +547,8 @@ app.post('/send-media', async (req, res) => {
     }
 
     const buffer = readFileSync(verdict.realPath);
-    const ext = filePath.toLowerCase().split('.').pop();
+    // Derive ext from the resolved real path (consistent with the bytes actually read).
+    const ext = (path.extname(verdict.realPath).slice(1) || filePath.toLowerCase().split('.').pop() || '').toLowerCase();
     const type = mediaType || inferMediaType(ext);
     let msgPayload;
 
@@ -563,8 +570,12 @@ app.post('/send-media', async (req, res) => {
         if (needsConversion) {
           tmpPath = path.join(tmpdir(), `hermes_voice_${randomBytes(6).toString('hex')}.ogg`);
           try {
-            execSync(
-              `ffmpeg -y -i ${JSON.stringify(verdict.realPath)} -ar 48000 -ac 1 -c:a libopus ${JSON.stringify(tmpPath)}`,
+            // execFileSync (no shell) — a crafted filename like `x$(id).mp3` inside an
+            // allowed dir must NOT be interpreted; JSON.stringify is JSON quoting, not
+            // shell escaping, so the previous execSync string was command-injectable.
+            execFileSync(
+              'ffmpeg',
+              ['-y', '-i', verdict.realPath, '-ar', '48000', '-ac', '1', '-c:a', 'libopus', tmpPath],
               { timeout: 30000, stdio: 'pipe' }
             );
             audioBuffer = readFileSync(tmpPath);
