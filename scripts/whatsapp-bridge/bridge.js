@@ -29,6 +29,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { tokensMatch, resolveAllowedDirs, isPathAllowed } from './bridge-security.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -51,6 +52,25 @@ const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cac
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+
+// Shared secret required on every state-changing / message-reading endpoint.
+// Loopback bind + Host validation stop remote & DNS-rebinding attackers but NOT a
+// co-located local process; the token ensures only the Hermes gateway can drive the
+// bridge. /health stays open for liveness probes. (CVE-2026-46555 class defense.)
+const BRIDGE_TOKEN = (process.env.WHATSAPP_BRIDGE_TOKEN || '').trim();
+
+// Directories /send-media is permitted to read from. Defaults to the media cache
+// dirs Hermes itself writes; operators extend via WHATSAPP_MEDIA_ALLOWED_DIRS
+// (colon-separated). Everything else — session creds, .env, ~/.ssh, patient data —
+// is denied, closing the arbitrary local-file read/exfil hole.
+const _mediaDirsFromEnv = (process.env.WHATSAPP_MEDIA_ALLOWED_DIRS || '')
+  .split(':').map((s) => s.trim()).filter(Boolean);
+const MEDIA_ALLOWED_DIRS = resolveAllowedDirs([
+  IMAGE_CACHE_DIR, DOCUMENT_CACHE_DIR, AUDIO_CACHE_DIR,
+  ..._mediaDirsFromEnv,
+]);
+// Always denied, even if an operator sets an over-broad allowed dir.
+const MEDIA_DENIED_DIRS = resolveAllowedDirs([SESSION_DIR]);
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -405,6 +425,24 @@ app.use((req, res, next) => {
   next();
 });
 
+// Bridge auth token — require a shared secret on every endpoint except /health.
+// Fails closed: if WHATSAPP_BRIDGE_TOKEN is unset the bridge refuses authenticated
+// requests (503) rather than silently allowing unauthenticated local access.
+const _OPEN_PATHS = new Set(['/health']);
+app.use((req, res, next) => {
+  if (_OPEN_PATHS.has(req.path)) return next();
+  if (!BRIDGE_TOKEN) {
+    return res.status(503).json({
+      error: 'Bridge auth not configured. Set WHATSAPP_BRIDGE_TOKEN in the environment.',
+    });
+  }
+  const provided = req.headers['x-bridge-token'];
+  if (!tokensMatch(typeof provided === 'string' ? provided : '', BRIDGE_TOKEN)) {
+    return res.status(401).json({ error: 'Invalid or missing bridge token' });
+  }
+  next();
+});
+
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
@@ -490,11 +528,19 @@ app.post('/send-media', async (req, res) => {
   }
 
   try {
-    if (!existsSync(filePath)) {
-      return res.status(404).json({ error: `File not found: ${filePath}` });
+    // Confine reads to the allow-listed media dirs (resolves symlinks + traversal).
+    // Prevents /send-media being used to exfil arbitrary local files.
+    const verdict = isPathAllowed(filePath, MEDIA_ALLOWED_DIRS, MEDIA_DENIED_DIRS);
+    if (!verdict.allowed) {
+      const status = verdict.reason === 'file not found' ? 404 : 403;
+      // Do not echo the resolved real path back to the caller.
+      console.warn(`[bridge] /send-media rejected filePath (${verdict.reason})`);
+      return res.status(status).json({
+        error: status === 404 ? 'File not found' : 'filePath is not within an allowed media directory',
+      });
     }
 
-    const buffer = readFileSync(filePath);
+    const buffer = readFileSync(verdict.realPath);
     const ext = filePath.toLowerCase().split('.').pop();
     const type = mediaType || inferMediaType(ext);
     let msgPayload;
@@ -518,7 +564,7 @@ app.post('/send-media', async (req, res) => {
           tmpPath = path.join(tmpdir(), `hermes_voice_${randomBytes(6).toString('hex')}.ogg`);
           try {
             execSync(
-              `ffmpeg -y -i ${JSON.stringify(filePath)} -ar 48000 -ac 1 -c:a libopus ${JSON.stringify(tmpPath)}`,
+              `ffmpeg -y -i ${JSON.stringify(verdict.realPath)} -ar 48000 -ac 1 -c:a libopus ${JSON.stringify(tmpPath)}`,
               { timeout: 30000, stdio: 'pipe' }
             );
             audioBuffer = readFileSync(tmpPath);
@@ -628,6 +674,12 @@ if (PAIR_ONLY) {
     } else {
       console.log(`⚠️  No WHATSAPP_ALLOWED_USERS set — all messages will be processed`);
     }
+    if (BRIDGE_TOKEN) {
+      console.log('🔐 Bridge auth token enabled (X-Bridge-Token required on all endpoints except /health)');
+    } else {
+      console.warn('🚨 SECURITY: WHATSAPP_BRIDGE_TOKEN is not set — authenticated endpoints will reject with 503 until configured. Set it and give the gateway the same value.');
+    }
+    console.log(`📂 /send-media allowed dirs: ${MEDIA_ALLOWED_DIRS.join(', ') || '(none)'}`);
     console.log();
     startSocket();
   });

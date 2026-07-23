@@ -170,6 +170,12 @@ class WhatsAppAdapter(BasePlatformAdapter):
             "bridge_script",
             str(self._DEFAULT_BRIDGE_DIR / "bridge.js"),
         )
+        # Shared secret sent as X-Bridge-Token on every bridge request and injected
+        # into the spawned bridge's env, so a single WHATSAPP_BRIDGE_TOKEN configures
+        # both sides. The bridge fails closed (503) when this is unset.
+        self._bridge_token: str = str(
+            config.extra.get("bridge_token") or os.getenv("WHATSAPP_BRIDGE_TOKEN") or ""
+        ).strip()
         self._session_path: Path = Path(config.extra.get(
             "session_path",
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
@@ -419,7 +425,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
                                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                 self._mark_connected()
                                 self._bridge_process = None  # Not managed by us
-                                self._http_session = aiohttp.ClientSession()
+                                self._http_session = aiohttp.ClientSession(
+                                    headers={"X-Bridge-Token": self._bridge_token} if self._bridge_token else {}
+                                )
                                 self._poll_task = asyncio.create_task(self._poll_messages())
                                 return True
                             else:
@@ -445,6 +453,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
             bridge_env = os.environ.copy()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            # Ensure the spawned bridge enforces the same token the adapter sends.
+            if self._bridge_token:
+                bridge_env["WHATSAPP_BRIDGE_TOKEN"] = self._bridge_token
 
             self._bridge_process = subprocess.Popen(
                 [
@@ -526,7 +537,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
             
             # Create a persistent HTTP session for all bridge communication
-            self._http_session = aiohttp.ClientSession()
+            self._http_session = aiohttp.ClientSession(
+                headers={"X-Bridge-Token": self._bridge_token} if self._bridge_token else {}
+            )
 
             # Start message polling task
             self._poll_task = asyncio.create_task(self._poll_messages())
